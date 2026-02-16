@@ -3,6 +3,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager # 수명 주기 관리
 from app.core.container import ai_container # 모델 정보(전역 인스턴스) 가져오기
+from app.services.session_manager import manager
 
 # 수명 주기 정의
 @asynccontextmanager
@@ -26,15 +27,24 @@ async def health_check():
 # 웹소켓 엔드포인트
 @app.websocket("/ws/counseling/{client_id}")
 async def counseling_endpoint(websocket: WebSocket, client_id: str):
-    await websocket.accept() # 클라이언트 연결 요청 수락
-    print(f">>> 클라이언트 연결됨: {client_id}")
+    # [초기 생성] 연결 요청 처리
+    await manager.connect(websocket, client_id)
+
     try:
-        while True: # 연결이 끊길 때까지 유지
+        # [실시간 파이프라인] 무한 루프로 데이터 대기
+        while True:
+            # 프론트에서 보낸 데이터 수신 (Text 형태의 JSON을 가정)
             data = await websocket.receive_text()
-            print(f">>> 받은 데이터: {data}")
-            await websocket.send_text(f"에코: {data}")
-    except Exception:
-        print(">>> WebSocket 연결 끊김")
+
+            # 매니저에게 데이터 넘기기
+            await manager.process_data(client_id, data)
+
+    except WebSocketDisconnect:
+        # 연결 끊기면 매니저에게 알림
+        manager.disconnect(client_id)
+    except Exception as e:
+        print(f"웹소캣 에러 발생: {e}")
+        manager.disconnect(client_id)                   
 
 if __name__ == "__main__":
     import uvicorn
