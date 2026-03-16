@@ -36,7 +36,8 @@ torchaudio --index-url https://download.pytorch.org/whl/cpu
 # openai-whisper>=20231117
 # speechbrain>=1.0.0
 # soundfile>=0.12.0
-# ffmpeg-python>=0.2.0 
+faster-whisper>=1.0.0
+ffmpeg-python>=0.2.0
 
 # --- D. Optional (성능 최적화 및 추가 기능) ---
 # peft>=0.13.0         

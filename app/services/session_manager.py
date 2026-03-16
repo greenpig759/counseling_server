@@ -1,3 +1,4 @@
+import asyncio
 import json
 import base64
 import logging
@@ -43,6 +44,26 @@ class ConnectionManager:
             ws = self.active_connections[client_id]
             await ws.send_text(json.dumps(message, ensure_ascii=False)) # 파이썬 딕셔너리를 문자열로 변환
 
+    # STT + LLM 백그라운드 처리 → 완료 시 클라이언트에 결과 전송
+    async def _process_speech_end(self, client_id: str):
+        stt_result = await pipeline.on_speech_end(client_id)
+        if not stt_result:
+            return
+
+        # STT 결과 전송
+        await self.send_personal_message(
+            {"status": "stt_done", "text": stt_result.text},
+            client_id
+        )
+
+        # LLM 응답 생성 및 전송 (DummyLLM 포함, 실제 모델 연결 시 자동 반영)
+        llm_response = pipeline.generate_response(client_id)
+        if llm_response:
+            await self.send_personal_message(
+                {"status": "response", "message": llm_response.reply_text},
+                client_id
+            )
+
     # [데이터 처리 파이프라인] 들어온 데이터 분류 및 처리
     async def process_data(self, client_id: str, raw_data: str):
         try:
@@ -58,10 +79,12 @@ class ConnectionManager:
                     base64_data = str(input_obj.data)
                     if "," in base64_data:
                         base64_data = base64_data.split(",")[1]
-                    pipeline.append_audio_chunk(client_id, base64.b64decode(base64_data))
+                    speech_ended = pipeline.append_audio_chunk(client_id, base64.b64decode(base64_data))
+                    # VAD가 침묵을 감지하면 백그라운드에서 STT+LLM 처리
+                    if speech_ended:
+                        asyncio.create_task(self._process_speech_end(client_id))
                 except Exception as e:
                     logger.error(f"[Error] 오디오 처리 실패: {e}")
-                # VAD 등 음성 처리 로직 추가
 
             # [이미지 데이터 처리]
             elif input_obj.type == "video":
@@ -75,16 +98,17 @@ class ConnectionManager:
                 except Exception as e:
                     logger.error(f"[Error] 이미지 변환 실패: {e}")
 
-            # [발화 신호 처리]
+            # [발화 신호 처리] - 제어 신호에만 ACK 응답
             elif input_obj.type == "control":
                 if input_obj.data == "END_OF_SPEECH":
                     logger.info(f"[Control] {client_id}의 발화 종료, 처리 시작 ...")
-                    pipeline.on_speech_end(client_id)
-                    # 말하기 종료 및 STT, LLM 로직 추가
+                    # 즉시 응답 후 STT는 백그라운드에서 처리 (WebSocket keepalive 유지)
                     await self.send_personal_message(
                         {"status": "processing", "message": "답변 생성 중..."},
                         client_id
                     )
+                    # 말하기 종료 및 STT, LLM 로직 추가
+                    asyncio.create_task(self._process_speech_end(client_id))
 
                 elif input_obj.data == "END_OF_SESSION":
                     logger.info(f"[Session] {client_id} 세션 종료 신호 수신")
@@ -93,10 +117,7 @@ class ConnectionManager:
             else:
                 logger.warning(f"[Session] 알 수 없는 타입: {input_obj.type}")
 
-            await self.send_personal_message(
-                ServerResponse(status="received", message=f"{input_obj.type} 수신 완료").model_dump(),
-                client_id
-            )
+            # audio/video는 fire-and-forget (ACK 없음), control 신호만 ACK
 
         except json.JSONDecodeError:
             logger.error(f"[Session] JSON 파싱 실패: {raw_data[:100]}")

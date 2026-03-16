@@ -7,7 +7,7 @@ from typing import Optional, Any
 class InputTest(BaseModel):
     type: str
     data: Any
-    session_id: str
+    session_id: Optional[str] = None  # URL 경로에서 받으므로 메시지에 없어도 됨
     timestamp: Optional[float] = None
 
 # -- [응답용] 잘 받았다고 서버가 보내줄 객체 --

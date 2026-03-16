@@ -1,6 +1,6 @@
 from ai_modules.interfaces import (
-    DummyVADModel, DummySTTModel, DummyAudioEmotionModel, DummyFaceEmotionModel, DummyLLMModel
-    # 실제 구현시 import 목록 바꿀 것
+    SileroVADModel, FasterWhisperSTTModel,
+    DummyAudioEmotionModel, DummyFaceEmotionModel, DummyLLMModel
 )
 
 # 모든 AI 모델을 한곳에서 관리하는 싱글톤(서버 전체에서 딱 하나의 인스턴스만 존재) 컨테이너
@@ -17,11 +17,11 @@ class AIContainer:
         print(">>> AI 모델 로딩을 시작합니다.....")
         
         # VAD (음성 감지)
-        self.vad = DummyVADModel() 
+        self.vad = SileroVADModel()
         self.vad.load_model()
-        
+
         # STT (음성 -> 텍스트)
-        self.stt = DummySTTModel() 
+        self.stt = FasterWhisperSTTModel(model_size="base")
         self.stt.load_model()
 
         # Emotion (음성 감정)
