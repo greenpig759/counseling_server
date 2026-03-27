@@ -10,6 +10,7 @@ requests>=2.32.0
 
 # Data Validation & Utils
 pydantic>=2.7.0
+pydantic-settings>=2.0.0
 numpy>=1.26.0
 
 # PyTorch (기본)
@@ -29,14 +30,15 @@ torchaudio --index-url https://download.pytorch.org/whl/cpu
 
 # --- B. Vision (DeepFace - 얼굴 감정 인식) ---
 # deepface>=0.0.93
-# opencv-python>=4.10.0
-# tf-keras>=2.15.0  
+opencv-python>=4.10.0
+# tf-keras>=2.15.0
 
 # --- C. Audio (Whisper STT, SpeechBrain, VAD) ---
 # openai-whisper>=20231117
 # speechbrain>=1.0.0
 # soundfile>=0.12.0
-# ffmpeg-python>=0.2.0 
+faster-whisper>=1.0.0
+ffmpeg-python>=0.2.0
 
 # --- D. Optional (성능 최적화 및 추가 기능) ---
 # peft>=0.13.0         

@@ -4,6 +4,13 @@ from typing import List, Optional, Dict, Any
 # 데이터 포맷 정리 코드(입력값, 출력값 둘 다 정의한 것)
 # 보고 어떤 포맷이 더 올바른지 정리해서 알려주기 바람
 
+# --- 초기 상담 설정 ---
+class CounselingSetup(BaseModel):
+    topic: str            # 상담 주제 (예: "직장 스트레스", "불면증 케어")
+    mood: str             # 현재 기분 (예: "happy", "sad", "anxious")
+    content: str          # 상담 내용 자유 입력 텍스트
+    style: Optional[str] = None  # 상담 방식 (예: "empathy")
+
 # --- 공통 결과 포맷 ---
 class EmotionResult(BaseModel):
     primary_emotion: str = Field(..., description="가장 확률이 높은 감정 (예: happy)")
@@ -33,10 +40,12 @@ class FaceInput(BaseModel):
 # --- 4. LLM (상담 생성) ---
 class LLMContext(BaseModel):
     user_text: str
-    face_emotion: Optional[str] = None
-    voice_emotion: Optional[str] = None
+    #
+    #counseling_setup: Optional[CounselingSetup] = None
+    face_emotions: List[EmotionResult] = []
+    voice_emotions: List[EmotionResult] = []
     text_emotion: Optional[str] = None
-    history: List[Dict[str, str]] = [] # [ {"content": "..."}, ...]
+    history: List[Dict[str, str]] = []  # [ {"content": "..."}, ...]
 
 class LLMResponse(BaseModel):
     reply_text: str
