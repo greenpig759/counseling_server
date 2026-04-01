@@ -19,6 +19,7 @@ tmp/
 # 테스트용 미디어 파일
 test_files/
 temp_frames/
+**/webm
 
 # OS
 .DS_Store
