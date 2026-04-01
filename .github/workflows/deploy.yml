@@ -1,21 +1,39 @@
-name: Deploy to AWS EC2
+name: FastAPI Auto Deploy
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main  # main 브랜치에 push 될 때만 작동혀라!
 
 jobs:
-  deploy:
+  build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: EC2 배포
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          script: |
-            cd /home/ubuntu/counseling_server
-            git pull origin main
-            docker compose up --build -d
+    - name: 1. 내 코드 가져오기 (Checkout)
+      uses: actions/checkout@v4
+
+    - name: 2. 도커 허브(Docker Hub) 로그인
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+
+    - name: 3. 도커 이미지 굽고 창고에 올리기 (Build & Push)
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ secrets.DOCKER_USERNAME }}/attune-api:latest
+
+    - name: 4. EC2 서버 접속해서 새 컨테이너 띄우기
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ubuntu
+        key: ${{ secrets.EC2_SSH_KEY }}
+        script: |
+          sudo docker pull ${{ secrets.DOCKER_USERNAME }}/attune-api:latest
+          sudo docker stop attune-server || true
+          sudo docker rm attune-server || true
+          sudo docker run -d -p 8000:8000 --name attune-server ${{ secrets.DOCKER_USERNAME }}/attune-api:latest
