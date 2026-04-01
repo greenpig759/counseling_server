@@ -1,0 +1,20 @@
+# PyTorch - GPU 서버용 (CUDA 12.1 기준)
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# ==========================================
+# Web Server & Data Utils
+# ==========================================
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-dotenv>=1.0.0
+websockets>=12.0
+requests>=2.32.0
+pydantic>=2.7.0
+pydantic-settings>=2.0.0
+numpy>=1.26.0
+
+# ==========================================
+# PyTorch (Core)
+# ==========================================
+torch
+torchaudio
