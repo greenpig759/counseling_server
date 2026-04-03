@@ -1,6 +1,7 @@
 import asyncio # 비동기 처리 라이브러리
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager # 수명 주기 관리
 from app.core.container import ai_container # 모델 정보(전역 인스턴스) 가져오기
 from app.services.session_manager import manager
@@ -15,6 +16,15 @@ async def lifespan(app: FastAPI):
 
 # 앱 생성
 app = FastAPI(title="AI 상담소 서버", lifespan=lifespan)
+
+# cors 설정 // 개발용으로 전부 열어둠
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # 작동 확인
 @app.get("/")
