@@ -43,8 +43,12 @@ async def counseling_endpoint(websocket: WebSocket, client_id: str):
 
         # [실시간 파이프라인] 무한 루프로 데이터 대기
         while True:
-            data = await websocket.receive_text()
-            await manager.process_data(client_id, data)
+            message = await websocket.receive()
+
+            if "text" in message:
+                await manager.process_text_data(client_id, message["text"])
+            elif "bytes" in message:
+                await manager.process_binary_data(client_id, message["bytes"])
 
     except WebSocketDisconnect:
         await manager.disconnect(client_id)
