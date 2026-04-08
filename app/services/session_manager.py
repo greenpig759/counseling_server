@@ -141,6 +141,7 @@ class ConnectionManager:
             # 음성 바이너리 처리
             if header == 1:
                 pipeline.append_audio_chunk(ticket_id, payload)
+                asyncio.create_task(pipeline._analyze_voice_emotion(ticket_id, payload))
 
                 self._audio_counts[ticket_id] = self._audio_counts.get(ticket_id, 0) + 1
                 if self._audio_counts[ticket_id] % 50 == 0:
