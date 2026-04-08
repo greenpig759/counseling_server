@@ -26,13 +26,13 @@ class CounselingPipeline:
         self._face_emotion_buffer: Dict[str, List[EmotionResult]] = {}
         self._voice_emotion_buffer: Dict[str, List[EmotionResult]] = {}
         self._stt_text_buffer: Dict[str, List[str]] = {}
-        # 브라우저 webm/opus 청크 누적 (배치 STT 폴백용)
+        # 16kHz Float32 PCM 청크 누적 버퍼 (배치 STT 폴백용)
         self._raw_audio_buffer: Dict[str, bytearray] = {}
-        # 청크별 실시간 STT 누적 텍스트
+        # 청크별 실시간 STT 누적 텍스트 (VAD 미사용 경로 폴백용)
         self._chunk_stt_text: Dict[str, str] = {}
         # 대화 히스토리 (멀티턴): [{"role": "user"|"assistant", "content": "..."}]
         self._conversation_history: Dict[str, List[Dict[str, str]]] = {}
-        # webm→PCM 변환 후 저장 (음성 감정 분석용)
+        # 음성 감정 분석용 마지막 PCM 스냅샷
         self._last_pcm_audio: Dict[str, bytes] = {}
 
     # 세션 수명 주기
@@ -101,16 +101,16 @@ class CounselingPipeline:
             )
         return response
 
-    # 오디오 청크 → AudioProcessor에 위임 (float32 PCM 입력 시 사용)
+    # 오디오 청크 → VAD 필터 → STT 큐 (AudioProcessor에 위임)
     def append_audio_chunk(self, session_id: str, chunk: bytes) -> bool:
         return self.audio.append_chunk(session_id, chunk)
 
-    # 16kHz Float32 PCM 청크 누적
+    # 16kHz Float32 PCM 청크 누적 (배치 STT 폴백용)
     def append_raw_audio_chunk(self, session_id: str, chunk: bytes) -> None:
         if session_id in self._raw_audio_buffer:
             self._raw_audio_buffer[session_id].extend(chunk)
 
-    # Float32 PCM 청크 → numpy → Whisper STT + 음성 감정 추출
+    # Float32 PCM 청크 → numpy → Whisper STT + 음성 감정 추출 (VAD 미사용 경로)
     async def transcribe_audio_chunk(self, session_id: str, chunk: bytes) -> None:
         if len(chunk) < 2000 or session_id not in self._chunk_stt_text:
             return
@@ -123,9 +123,7 @@ class CounselingPipeline:
             self._last_pcm_audio[session_id] = pcm_bytes
             stt_input = STTInput(audio_data=pcm_bytes)
 
-            # STT
             result = await loop.run_in_executor(None, self.container.stt.transcribe, stt_input)
-            # await 도중 세션이 정리됐을 수 있으므로 재확인
             if session_id not in self._chunk_stt_text:
                 return
             if result.text.strip():
@@ -134,14 +132,13 @@ class CounselingPipeline:
                 ).strip()
                 logger.info(f"[ChunkSTT] {session_id}: +'{result.text.strip()}' → 누적: '{self._chunk_stt_text[session_id]}'")
 
-            # 음성 감정 추출 → 버퍼 누적
             try:
                 voice_emotion = await loop.run_in_executor(
                     None, self.container.audio_emotion.analyze, stt_input
                 )
                 if session_id in self._voice_emotion_buffer:
                     self._voice_emotion_buffer[session_id].append(voice_emotion)
-                    logger.info(f"[ChunkVoiceEmo] {session_id}: {voice_emotion.primary_emotion} {voice_emotion.probabilities}")
+                    logger.info(f"[ChunkVoiceEmo] {session_id}: {voice_emotion.primary_emotion}")
             except Exception as e:
                 logger.error(f"[ChunkVoiceEmo] {session_id}: 오류: {e}")
 
@@ -149,7 +146,6 @@ class CounselingPipeline:
             logger.error(f"[ChunkSTT] {session_id}: 오류: {e}")
 
     # PCM 누적 버퍼 → Whisper 배치 STT (폴백용)
-    # transcribe_pcm_chunk()에서 모든 청크가 2000바이트 미만이라 스킵되어 _chunk_stt_text가 완전히 비어있을 때 사용
     async def _transcribe_raw_audio(self, session_id: str) -> Optional[STTOutput]:
         raw = bytes(self._raw_audio_buffer.get(session_id, bytearray()))
         if len(raw) < 2000:
@@ -164,10 +160,9 @@ class CounselingPipeline:
                 return None
             logger.info(f"[RawSTT] {session_id}: PCM 변환 완료 ({audio_array.size}샘플) → Whisper 실행")
             pcm_bytes = audio_array.tobytes()
-            self._last_pcm_audio[session_id] = pcm_bytes  # 음성 감정 분석용 저장
+            self._last_pcm_audio[session_id] = pcm_bytes
             stt_input = STTInput(audio_data=pcm_bytes)
             result = await loop.run_in_executor(None, self.container.stt.transcribe, stt_input)
-            # 다음 발화를 위해 버퍼 초기화
             self._raw_audio_buffer[session_id] = bytearray()
             logger.info(f"[RawSTT] {session_id}: 결과='{result.text}'")
             return result
@@ -184,10 +179,10 @@ class CounselingPipeline:
 
     # 발화 종료 → STT 완료 대기 → 음성 감정 → 결과 반환
     async def on_speech_end(self, session_id: str) -> Optional[STTOutput]:
-        # 1. 증분 STT 결과 대기 (VAD 기반 - float32 PCM 입력 시 동작)
+        # 1. VAD 필터링된 증분 STT 결과 대기 (주 경로)
         accumulated = await self.audio.wait_and_get_text(session_id)
 
-        # 2. 청크별 실시간 STT 누적 텍스트 사용
+        # 2. 폴백: VAD 결과 없을 때 청크별 직접 STT 누적 텍스트 사용
         if not accumulated:
             accumulated = self._chunk_stt_text.get(session_id, "").strip()
             self._chunk_stt_text[session_id] = ""
@@ -196,7 +191,7 @@ class CounselingPipeline:
 
         # 3. 폴백: 전체 버퍼 배치 STT
         if not accumulated:
-            logger.info(f"[SpeechEnd] {session_id}: 청크 STT 없음 → 배치 STT 폴백 (webm→PCM)")
+            logger.info(f"[SpeechEnd] {session_id}: 청크 STT 없음 → 배치 STT 폴백")
             raw_result = await self._transcribe_raw_audio(session_id)
             if raw_result and raw_result.text.strip():
                 accumulated = raw_result.text.strip()
@@ -207,9 +202,21 @@ class CounselingPipeline:
         if session_id not in self._stt_text_buffer:
             return None
 
+        # 음성 감정 분석 — VAD가 추출한 마지막 발화 세그먼트 사용
+        voice_pcm = self.audio.get_last_audio_snapshot(session_id)
+        if voice_pcm and session_id in self._voice_emotion_buffer:
+            try:
+                loop = asyncio.get_event_loop()
+                voice_emotion = await loop.run_in_executor(
+                    None, self.container.audio_emotion.analyze, STTInput(audio_data=voice_pcm)
+                )
+                self._voice_emotion_buffer[session_id].append(voice_emotion)
+                logger.info(f"[VoiceEmo] {session_id}: {voice_emotion.primary_emotion} {voice_emotion.probabilities}")
+            except Exception as e:
+                logger.error(f"[VoiceEmo] {session_id}: 오류: {e}")
+
         self._stt_text_buffer[session_id].append(accumulated)
         logger.info(f"[SpeechEnd] {session_id}: 최종 텍스트 = '{accumulated}'")
-
         return STTOutput(text=accumulated, language="ko")
 
     # 여러 EmotionResult 리스트에서 확률 평균 → 대표 감정 1개 반환

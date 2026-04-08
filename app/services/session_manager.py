@@ -140,13 +140,12 @@ class ConnectionManager:
 
             # 음성 바이너리 처리
             if header == 1:
-                pipeline.append_raw_audio_chunk(ticket_id, payload)
-                asyncio.create_task(pipeline.transcribe_audio_chunk(ticket_id, payload))
+                pipeline.append_audio_chunk(ticket_id, payload)
 
                 self._audio_counts[ticket_id] = self._audio_counts.get(ticket_id, 0) + 1
                 if self._audio_counts[ticket_id] % 50 == 0:
-                    buf_size = len(pipeline._raw_audio_buffer.get(ticket_id, b""))
-                    logger.info(f"[Audio] {ticket_id}: {self._audio_counts[ticket_id]}청크 수신 /버퍼 {buf_size//1024}kb 누적")
+                    buf_size = len(pipeline.audio._audio_buffers.get(ticket_id, b""))
+                    logger.info(f"[Audio] {ticket_id}: {self._audio_counts[ticket_id]}청크 수신 / VAD 버퍼 {buf_size//1024}kb 누적")
 
             # 영상 바이너리 처리
             elif header == 2:

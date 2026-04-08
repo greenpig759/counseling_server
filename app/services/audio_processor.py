@@ -24,15 +24,25 @@ class AudioProcessor:
 
     def __init__(self, container: AIContainer):
         self.container = container
+        # VAD를 통과한 음성 구간만 누적하는 STT 입력 버퍼 (침묵 감지 시 STT 큐로 전달 후 비워짐)
         self._audio_buffers: Dict[str, bytearray] = {}
+        # 입력 청크를 VAD_CHUNK_BYTES 단위로 정렬하기 위한 정렬 버퍼 (잔여 바이트 임시 보관)
         self._vad_chunk_buffer: Dict[str, bytearray] = {}
-        self._pre_roll: Dict[str, bytearray] = {}       # 발화 시작 직전 0.5초 버퍼
-        self._is_speaking: Dict[str, bool] = {}         # 현재 발화 중 여부
+        # 발화 시작 직전 0.5초를 보관하는 pre-roll 버퍼 (발화 첫 음절 잘림 방지)
+        self._pre_roll: Dict[str, bytearray] = {}
+        # 현재 발화 중 여부 (True: 음성 구간, False: 침묵 구간)
+        self._is_speaking: Dict[str, bool] = {}
+        # 발화 종료 후 연속 침묵 샘플 수 카운터 (SILENCE_THRESHOLD_SEC 초과 시 STT 큐 등록)
         self._silence_samples: Dict[str, int] = {}
+        # STT 워커가 현재 추론 중인지 여부 (wait_and_get_text의 완료 대기 판단에 사용)
         self._stt_running: Dict[str, bool] = {}
+        # 워커가 STT 결과를 누적하는 텍스트 버퍼 (wait_and_get_text 호출 시 반환 후 초기화)
         self._accumulated_text: Dict[str, str] = {}
+        # VAD가 추출한 음성 세그먼트를 STT 워커에 전달하는 asyncio 큐
         self._transcription_queue: Dict[str, asyncio.Queue] = {}
+        # 세션별 STT 워커 asyncio.Task 핸들 (세션 종료 시 cancel에 사용)
         self._transcription_tasks: Dict[str, asyncio.Task] = {}
+        # VAD가 마지막으로 추출한 음성 세그먼트 (음성 감정 분석 시 pipeline에서 참조)
         self._last_audio_snapshot: Dict[str, bytes] = {}
 
     def init_session(self, session_id: str) -> None:
