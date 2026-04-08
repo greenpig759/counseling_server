@@ -85,10 +85,12 @@ class AudioProcessor:
         try:
             while True:
                 audio_bytes = await queue.get()
+                # queue.get() 직후 즉시 설정 — wait_and_get_text의 race condition 방지
+                if session_id in self._stt_running:
+                    self._stt_running[session_id] = True
                 try:
                     if session_id not in self._accumulated_text:
                         continue
-                    self._stt_running[session_id] = True
                     stt_input = STTInput(audio_data=audio_bytes)
                     stt_result = await loop.run_in_executor(None, self.container.stt.transcribe, stt_input)
                     if session_id in self._accumulated_text and stt_result.text.strip():
@@ -154,12 +156,26 @@ class AudioProcessor:
 
         return False  # 아직 발화 중 또는 침묵 대기
 
-    # STT 큐 완료 대기 후 누적 텍스트 반환 (없으면 폴백 직접 STT)
+    # STT 큐 완료 대기 후 누적 텍스트 반환
     async def wait_and_get_text(self, session_id: str) -> Optional[str]:
         if session_id not in self._transcription_queue:
             return None
 
         queue = self._transcription_queue[session_id]
+
+        # END_OF_SPEECH 도착 시 VAD가 아직 큐에 안 넣은 잔여 음성 강제 플러시
+        # (발화 직후 END_OF_SPEECH가 와서 VAD 침묵 임계값이 아직 안 찼을 경우)
+        remaining = bytes(self._audio_buffers.get(session_id, b""))
+        if remaining and len(remaining) >= MIN_SPEECH_BYTES:
+            self._audio_buffers[session_id].clear()
+            self._is_speaking[session_id] = False
+            self._silence_samples[session_id] = 0
+            self._last_audio_snapshot[session_id] = remaining
+            try:
+                queue.put_nowait(remaining)
+                logger.info(f"[SpeechEnd] {session_id}: 미플러시 음성 강제 STT 큐 등록 ({len(remaining)}B)")
+            except asyncio.QueueFull:
+                logger.warning(f"[SpeechEnd] {session_id}: STT 큐 가득 참, 잔여 음성 버림")
 
         if not queue.empty() or self._stt_running.get(session_id, False):
             logger.info(f"[SpeechEnd] {session_id}: 증분 STT 완료 대기 중...")

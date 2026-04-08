@@ -34,6 +34,8 @@ class CounselingPipeline:
         self._conversation_history: Dict[str, List[Dict[str, str]]] = {}
         # 음성 감정 분석용 마지막 PCM 스냅샷
         self._last_pcm_audio: Dict[str, bytes] = {}
+        # 음성 감정 분석 백그라운드 태스크 (LLM과 병렬 실행)
+        self._voice_emotion_tasks: Dict[str, asyncio.Task] = {}
 
     # 세션 수명 주기
 
@@ -51,6 +53,10 @@ class CounselingPipeline:
 
     def cleanup_session(self, session_id: str) -> None:
         self.audio.cleanup_session(session_id)
+        # 음성 감정 태스크가 남아있으면 취소
+        task = self._voice_emotion_tasks.pop(session_id, None)
+        if task and not task.done():
+            task.cancel()
         for buf in (
             self._counseling_setup,
             self._face_emotion_buffer,
@@ -177,7 +183,7 @@ class CounselingPipeline:
         logger.info(f"[Face] {session_id}: {result.primary_emotion} {result.probabilities}")
         return result
 
-    # 발화 종료 → STT 완료 대기 → 음성 감정 → 결과 반환
+    # 발화 종료 → STT 완료 대기 → 음성 감정 백그라운드 시작 → 결과 반환
     async def on_speech_end(self, session_id: str) -> Optional[STTOutput]:
         # 1. VAD 필터링된 증분 STT 결과 대기 (주 경로)
         accumulated = await self.audio.wait_and_get_text(session_id)
@@ -202,22 +208,30 @@ class CounselingPipeline:
         if session_id not in self._stt_text_buffer:
             return None
 
-        # 음성 감정 분석 — VAD가 추출한 마지막 발화 세그먼트 사용
+        # 음성 감정 분석 — LLM과 병렬 실행하기 위해 백그라운드 태스크로 분리
+        # generate_response() 초반에 결과를 join함
         voice_pcm = self.audio.get_last_audio_snapshot(session_id)
         if voice_pcm and session_id in self._voice_emotion_buffer:
-            try:
-                loop = asyncio.get_event_loop()
-                voice_emotion = await loop.run_in_executor(
-                    None, self.container.audio_emotion.analyze, STTInput(audio_data=voice_pcm)
-                )
-                self._voice_emotion_buffer[session_id].append(voice_emotion)
-                logger.info(f"[VoiceEmo] {session_id}: {voice_emotion.primary_emotion} {voice_emotion.probabilities}")
-            except Exception as e:
-                logger.error(f"[VoiceEmo] {session_id}: 오류: {e}")
+            self._voice_emotion_tasks[session_id] = asyncio.create_task(
+                self._analyze_voice_emotion(session_id, voice_pcm)
+            )
 
         self._stt_text_buffer[session_id].append(accumulated)
         logger.info(f"[SpeechEnd] {session_id}: 최종 텍스트 = '{accumulated}'")
         return STTOutput(text=accumulated, language="ko")
+
+    # 음성 감정 분석 백그라운드 태스크
+    async def _analyze_voice_emotion(self, session_id: str, voice_pcm: bytes) -> None:
+        try:
+            loop = asyncio.get_event_loop()
+            voice_emotion = await loop.run_in_executor(
+                None, self.container.audio_emotion.analyze, STTInput(audio_data=voice_pcm)
+            )
+            if session_id in self._voice_emotion_buffer:
+                self._voice_emotion_buffer[session_id].append(voice_emotion)
+                logger.info(f"[VoiceEmo] {session_id}: {voice_emotion.primary_emotion} {voice_emotion.probabilities}")
+        except Exception as e:
+            logger.error(f"[VoiceEmo] {session_id}: 오류: {e}")
 
     # 여러 EmotionResult 리스트에서 확률 평균 → 대표 감정 1개 반환
     @staticmethod
@@ -242,6 +256,11 @@ class CounselingPipeline:
         if not accumulated_text:
             logger.warning(f"[Generate] {session_id}: 누적 텍스트 없음, 건너뜀")
             return None
+
+        # 음성 감정 백그라운드 태스크 완료 대기 (on_speech_end에서 시작, LLM과 병렬 실행됨)
+        voice_task = self._voice_emotion_tasks.pop(session_id, None)
+        if voice_task:
+            await voice_task
 
         face_emotions = self._face_emotion_buffer.get(session_id, [])
         voice_emotions = self._voice_emotion_buffer.get(session_id, [])
