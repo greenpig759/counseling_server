@@ -24,15 +24,25 @@ class AudioProcessor:
 
     def __init__(self, container: AIContainer):
         self.container = container
+        # VAD를 통과한 음성 구간만 누적하는 STT 입력 버퍼 (END_OF_SPEECH 시 일괄 STT 처리)
         self._audio_buffers: Dict[str, bytearray] = {}
+        # 입력 청크를 VAD_CHUNK_BYTES 단위로 정렬하기 위한 정렬 버퍼 (잔여 바이트 임시 보관)
         self._vad_chunk_buffer: Dict[str, bytearray] = {}
-        self._pre_roll: Dict[str, bytearray] = {}       # 발화 시작 직전 0.5초 버퍼
-        self._is_speaking: Dict[str, bool] = {}         # 현재 발화 중 여부
+        # 발화 시작 직전 0.5초를 보관하는 pre-roll 버퍼 (발화 첫 음절 잘림 방지)
+        self._pre_roll: Dict[str, bytearray] = {}
+        # 현재 발화 중 여부 (True: 음성 구간, False: 침묵 구간)
+        self._is_speaking: Dict[str, bool] = {}
+        # 발화 종료 후 연속 침묵 샘플 수 카운터 (SILENCE_THRESHOLD_SEC 초과 시 STT 큐 등록)
         self._silence_samples: Dict[str, int] = {}
+        # STT 워커가 현재 추론 중인지 여부 (wait_and_get_text의 완료 대기 판단에 사용)
         self._stt_running: Dict[str, bool] = {}
+        # 워커가 STT 결과를 누적하는 텍스트 버퍼 (wait_and_get_text 호출 시 반환 후 초기화)
         self._accumulated_text: Dict[str, str] = {}
+        # VAD가 추출한 음성 세그먼트를 STT 워커에 전달하는 asyncio 큐
         self._transcription_queue: Dict[str, asyncio.Queue] = {}
+        # 세션별 STT 워커 asyncio.Task 핸들 (세션 종료 시 cancel에 사용)
         self._transcription_tasks: Dict[str, asyncio.Task] = {}
+        # VAD가 마지막으로 추출한 음성 세그먼트 (음성 감정 분석 시 pipeline에서 참조)
         self._last_audio_snapshot: Dict[str, bytes] = {}
 
     def init_session(self, session_id: str) -> None:
@@ -75,10 +85,12 @@ class AudioProcessor:
         try:
             while True:
                 audio_bytes = await queue.get()
+                # queue.get() 직후 즉시 설정 — wait_and_get_text의 race condition 방지
+                if session_id in self._stt_running:
+                    self._stt_running[session_id] = True
                 try:
                     if session_id not in self._accumulated_text:
                         continue
-                    self._stt_running[session_id] = True
                     stt_input = STTInput(audio_data=audio_bytes)
                     stt_result = await loop.run_in_executor(None, self.container.stt.transcribe, stt_input)
                     if session_id in self._accumulated_text and stt_result.text.strip():
@@ -96,7 +108,7 @@ class AudioProcessor:
         except asyncio.CancelledError:
             logger.info(f"[IncrSTT] {session_id}: 워커 종료")
 
-    # 오디오 청크 누적 + VAD 음성/침묵 감지 → 음성 구간만 STT 버퍼에 누적, 침묵 시 STT 큐 등록
+    # 오디오 청크 누적 + VAD 음성/침묵 감지 → 음성 구간만 _audio_buffers에 누적 (END_OF_SPEECH까지 유지)
     def append_chunk(self, session_id: str, chunk: bytes) -> bool:
         self._vad_chunk_buffer[session_id].extend(chunk)
 
@@ -128,57 +140,46 @@ class AudioProcessor:
                     if silence_sec >= SILENCE_THRESHOLD_SEC:
                         self._is_speaking[session_id] = False
                         self._silence_samples[session_id] = 0
-                        audio_snapshot = bytes(self._audio_buffers[session_id])
-                        self._audio_buffers[session_id].clear()
-                        if audio_snapshot and session_id in self._transcription_queue:
-                            if len(audio_snapshot) < MIN_SPEECH_BYTES:
-                                logger.debug(f"[VAD] {session_id}: 세그먼트 너무 짧음 ({len(audio_snapshot)}B < {MIN_SPEECH_BYTES}B), 스킵")
-                            else:
-                                self._last_audio_snapshot[session_id] = audio_snapshot
-                                try:
-                                    self._transcription_queue[session_id].put_nowait(audio_snapshot)
-                                    logger.info(f"[VAD] {session_id}: {silence_sec:.1f}초 침묵 → STT 큐 등록 ({len(audio_snapshot)}B)")
-                                except asyncio.QueueFull:
-                                    logger.warning(f"[VAD] {session_id}: STT 큐 가득 참, 세그먼트 버림")
+                        # 단순 누적 방식: 침묵 감지 후에도 _audio_buffers 유지
+                        # END_OF_SPEECH 신호 시 wait_and_get_text()에서 일괄 STT 처리
+                        logger.debug(f"[VAD] {session_id}: 침묵 감지, 발화 구간 누적 유지 ({len(self._audio_buffers[session_id])}B)")
                         return True  # 발화 종료 신호
 
         return False  # 아직 발화 중 또는 침묵 대기
 
-    # STT 큐 완료 대기 후 누적 텍스트 반환 (없으면 폴백 직접 STT)
+    # END_OF_SPEECH 신호 시 VAD 누적 음성 전체를 한 번에 STT 처리 후 반환
     async def wait_and_get_text(self, session_id: str) -> Optional[str]:
-        if session_id not in self._transcription_queue:
+        if session_id not in self._audio_buffers:
             return None
 
-        queue = self._transcription_queue[session_id]
+        # VAD가 누적한 음성 구간 전체 추출
+        audio_data = bytes(self._audio_buffers.get(session_id, b""))
+        self._audio_buffers[session_id].clear()
+        self._is_speaking[session_id] = False
+        self._silence_samples[session_id] = 0
 
-        if not queue.empty() or self._stt_running.get(session_id, False):
-            logger.info(f"[SpeechEnd] {session_id}: 증분 STT 완료 대기 중...")
-            await queue.join()
+        if not audio_data or len(audio_data) < MIN_SPEECH_BYTES:
+            logger.warning(f"[SpeechEnd] {session_id}: 누적 음성 없거나 너무 짧음 ({len(audio_data)}B), 건너뜀")
+            return None
 
-        accumulated = self._accumulated_text.get(session_id, "").strip()
+        self._last_audio_snapshot[session_id] = audio_data
+        logger.info(f"[SpeechEnd] {session_id}: VAD 누적 음성 일괄 STT 처리 ({len(audio_data)}B)")
 
-        # 폴백: 큐 처리가 안 됐고 버퍼에 오디오가 남아있는 경우
-        if not accumulated:
-            audio_data = bytes(self._audio_buffers[session_id])
-            if not audio_data:
-                return None
-            logger.info(f"[SpeechEnd] {session_id}: 폴백 STT ({len(audio_data)}B)")
-            stt_input = STTInput(audio_data=audio_data)
-            self._audio_buffers[session_id].clear()
-            loop = asyncio.get_event_loop()
-            self._stt_running[session_id] = True
-            try:
-                stt_result = await loop.run_in_executor(None, self.container.stt.transcribe, stt_input)
-                accumulated = stt_result.text.strip()
-            finally:
-                if session_id in self._stt_running:
-                    self._stt_running[session_id] = False
-
-        # 다음 발화를 위해 초기화
-        if session_id in self._accumulated_text:
-            self._accumulated_text[session_id] = ""
-
-        return accumulated or None
+        loop = asyncio.get_event_loop()
+        self._stt_running[session_id] = True
+        try:
+            stt_result = await loop.run_in_executor(
+                None, self.container.stt.transcribe, STTInput(audio_data=audio_data)
+            )
+            result_text = stt_result.text.strip()
+            logger.info(f"[SpeechEnd] {session_id}: STT 결과='{result_text}'")
+            return result_text or None
+        except Exception as e:
+            logger.error(f"[SpeechEnd] {session_id}: STT 오류: {e}")
+            return None
+        finally:
+            if session_id in self._stt_running:
+                self._stt_running[session_id] = False
 
     def get_last_audio_snapshot(self, session_id: str) -> bytes:
         """음성 감정 분석용 마지막 오디오 스냅샷 반환"""
