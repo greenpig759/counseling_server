@@ -91,13 +91,23 @@ class ConnectionManager:
                     topic=d["topic"],
                     mood=d["mood"],
                     content=d["content"],
-                ) 
-                initial_response = pipeline.generate_initial_questions(ticket_id) # 초기 질문 생성
-                if initial_response: # 답변을 만든 경우에만 작동
-                    await self.send_personal_message( # 답변 전송
-                        {"status": "initial_questions", "message": initial_response.reply_text},
-                        ticket_id
-                    )
+                )
+                # 플랜 생성 + 첫 상담사 발화
+                result = await pipeline.session.start_counseling(
+                    ticket_id,
+                    topic=d["topic"],
+                    mood=d["mood"],
+                    content=d["content"],
+                )
+                await self.send_personal_message(
+                    {
+                        "status": "counseling_ready",
+                        "message": result["first_message"],
+                        "plan": result["plan"],
+                        "step_status": result["step_status"],
+                    },
+                    ticket_id,
+                )
 
             # [발화 신호 처리]
             elif input_obj.type == "control":
