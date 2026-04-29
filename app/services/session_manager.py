@@ -126,6 +126,7 @@ class ConnectionManager:
                         "status": "counseling_ready",
                         "message": result["first_message"],
                         "plan": result["plan"],
+                        "analysis": result.get("analysis", {}),
                         "step_status": result["step_status"],
                     },
                     ticket_id,

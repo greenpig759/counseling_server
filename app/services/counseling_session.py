@@ -1,6 +1,6 @@
 """
 CounselingSession — 세션 단위 상담 오케스트레이터.
-setup 데이터 → 플랜 생성 → StepManager 초기화 → 첫 발화 생성.
+setup 데이터 → 플랜 생성(병렬) + 첫 발화 생성 → StepManager + HistoryManager 초기화.
 """
 
 import asyncio
@@ -12,6 +12,7 @@ from ai_modules.schemas import CounselingSetup, LLMContext, LLMResponse
 from app.core.container import AIContainer
 from app.services.plan_generator import DynamicPlanGenerator
 from app.services.step_manager import StepManager
+from app.services.history_manager import HistoryManager
 from app.services.emotion_monitor import EmotionMonitor
 
 logger = logging.getLogger(__name__)
@@ -19,14 +20,13 @@ logger = logging.getLogger(__name__)
 
 class CounselingSession:
     """
-    세션별 상담 상태를 관리하고, 초기 상담 플로우를 오케스트레이션한다.
+    세션별 상담 상태 관리 + 초기 상담 플로우 오케스트레이션.
 
     초기 상담 플로우:
     1. setup 데이터 수신
-    2. GPT-4o-mini → 5-step 플랜 생성
-    3. StepManager 초기화
-    4. Step 1 시스템 프롬프트 → Qwen LLM → 첫 상담사 발화 생성
-    5. 클라이언트에 플랜 + 첫 발화 반환
+    2. GPT-4o-mini 5-step 플랜 생성 + Qwen 첫 발화 병렬 실행
+    3. StepManager + HistoryManager 초기화
+    4. 클라이언트에 플랜 + 첫 발화 반환
     """
 
     def __init__(self, container: AIContainer):
@@ -36,34 +36,23 @@ class CounselingSession:
         # 세션별 상태
         self._setups: Dict[str, CounselingSetup] = {}
         self._step_managers: Dict[str, StepManager] = {}
-        self._histories: Dict[str, List[Dict[str, str]]] = {}
+        self._history_managers: Dict[str, HistoryManager] = {}
 
     def init_session(self, session_id: str) -> None:
-        self._histories[session_id] = []
+        self._history_managers[session_id] = HistoryManager(max_recent_turns=4)
         self.emotion_monitor.init_session(session_id)
 
     def cleanup_session(self, session_id: str) -> None:
         self._setups.pop(session_id, None)
         self._step_managers.pop(session_id, None)
-        self._histories.pop(session_id, None)
+        self._history_managers.pop(session_id, None)
         self.emotion_monitor.cleanup_session(session_id)
 
     def get_step_manager(self, session_id: str) -> Optional[StepManager]:
         return self._step_managers.get(session_id)
 
-    def get_history(self, session_id: str) -> List[Dict[str, str]]:
-        return self._histories.get(session_id, [])
-
-    def add_to_history(self, session_id: str, user_text: str, assistant_text: str) -> None:
-        """매 턴 종료 후 대화 히스토리에 추가. 최대 20개(10턴) 유지."""
-        history = self._histories.get(session_id)
-        if history is None:
-            return
-        history.append({"role": "user", "content": user_text})
-        history.append({"role": "assistant", "content": assistant_text})
-        if len(history) > 20:
-            # setup 첫 2개(user_setup + assistant_first)는 보존, 나머지 오래된 것 제거
-            self._histories[session_id] = history[:2] + history[-(20 - 2):]
+    def get_history_manager(self, session_id: str) -> Optional[HistoryManager]:
+        return self._history_managers.get(session_id)
 
     async def start_counseling(
         self, session_id: str, topic: str, mood: str, content: str
@@ -73,6 +62,7 @@ class CounselingSession:
 
         Returns: {
             "plan": [...],
+            "analysis": {...},
             "first_message": "...",
             "step_status": {...}
         }
@@ -85,7 +75,7 @@ class CounselingSession:
 
         # GPT 플랜 생성 + Qwen 첫 발화 병렬 실행
         # - 첫 발화는 플랜 없이 즉시 생성 가능한 인트로 프롬프트 사용
-        # - GPT 플랜이 완료되면 StepManager 초기화 → 2번째 턴부터 GPT 질문 주입
+        # - GPT 플랜이 완료되면 StepManager 초기화 → 2번째 턴부터 GPT 질문 + 분석 주입
         plan_future = loop.run_in_executor(
             None, self.plan_generator.generate, topic, mood, content
         )
@@ -101,29 +91,30 @@ class CounselingSession:
         self._step_managers[session_id] = step_mgr
         logger.info(
             f"[Session] {session_id}: StepManager 초기화 완료 "
-            f"(Step 1: '{step_mgr.current_step['title']}', "
+            f"(Step 1: '{step_mgr.current_step['name']}', "
             f"Q1: '{step_mgr.get_current_question()}')"
         )
 
-        # 히스토리에 기록
-        if session_id in self._histories:
-            self._histories[session_id].append(
-                {"role": "user", "content": f"[상담 시작] 주제: {topic}, 기분: {mood}, 내용: {content}"}
+        # HistoryManager에 첫 발화 기록
+        history_mgr = self._history_managers.get(session_id)
+        if history_mgr:
+            history_mgr.add_user_message(
+                f"[상담 시작] 주제: {topic}, 기분: {mood}, 내용: {content}"
             )
-            self._histories[session_id].append(
-                {"role": "assistant", "content": first_message}
-            )
+            history_mgr.add_assistant_message(first_message)
 
         return {
             "plan": [
                 {
                     "step": s["step"],
-                    "title": s["title"],
+                    "title": s["name"],
                     "goal": s["goal"],
-                    "questions": s.get("questions", []),
+                    "focus": s.get("focus", ""),
+                    "questions": s.get("key_questions", []),
                 }
-                for s in plan
+                for s in plan["steps"]
             ],
+            "analysis": plan.get("analysis", {}),
             "first_message": first_message,
             "step_status": step_mgr.get_status(),
         }
@@ -131,7 +122,7 @@ class CounselingSession:
     async def _generate_quick_opening(self, session_id: str, setup: CounselingSetup) -> str:
         """
         GPT 플랜 없이 즉시 생성 가능한 첫 인사 (plan_generator와 병렬 실행용).
-        인트로 프롬프트는 하드코딩 → 2번째 턴부터 GPT 플랜의 질문이 주입됨.
+        인트로 프롬프트는 하드코딩 → 2번째 턴부터 GPT 플랜의 질문 + 분석이 주입됨.
         """
         INTRO_PROMPT = (
             "당신은 따뜻하고 공감적인 AI 심리상담사 '루나'입니다. "

@@ -227,6 +227,52 @@ class CounselingPipeline:
         primary = max(prob_dict, key=prob_dict.get)
         return EmotionResult(primary_emotion=primary, probabilities=prob_dict)
 
+    @staticmethod
+    def _build_dynamic_system_prompt(step_mgr, current_q, history_mgr) -> str:
+        """
+        분석(인지 왜곡) + 현재 단계(목표/집중) + 이전 단계 요약 + 응답 지시를 조립.
+        """
+        KOREAN_RULE = "반드시 한국어로만 답변하세요. 영어 단어는 절대 사용하지 마세요."
+        analysis = step_mgr.analysis or {}
+        step = step_mgr.current_step
+
+        parts = [
+            "[당신의 역할]",
+            "당신은 따뜻하고 공감적인 CBT(인지행동치료) 전문 상담사 '루나'입니다.",
+            KOREAN_RULE,
+            "",
+            "[내담자 분석]",
+            f"- 핵심 문제: {analysis.get('core_problem', '미분석')}",
+            f"- 예상 인지 왜곡: {analysis.get('cognitive_pattern', '미분석')}",
+            "",
+            f"[현재 단계: Step {step_mgr.step_number} - {step['name']}]",
+            f"- 목표: {step.get('goal', '')}",
+            f"- 집중 포인트(CBT 기법): {step.get('focus', '')}",
+        ]
+
+        # 이전 단계 요약 주입
+        if history_mgr:
+            summaries = history_mgr.get_step_summaries()
+            if summaries:
+                parts.append("")
+                parts.append("[이전 단계에서 발견한 것]")
+                for step_num in sorted(summaries.keys()):
+                    info = summaries[step_num]
+                    parts.append(f"- Step {step_num} ({info['step_name']}): {info['summary']}")
+
+        if current_q:
+            parts.extend([
+                "",
+                "[이번 응답 지시 - 반드시 준수]",
+                "① 사용자의 말에 1~2문장으로 진심 어린 공감을 표현하세요.",
+                "② 위 [집중 포인트]의 CBT 기법을 활용하여, 아래 질문을 자연스럽게 이어서 마지막에 물어보세요:",
+                f"   {current_q}",
+                "③ 이 질문 외에 다른 질문은 절대 추가하지 마세요.",
+                "④ 감정에 함몰되지 말고, 사용자의 사고 패턴과 사건 분석에 집중하세요.",
+            ])
+
+        return "\n".join(parts)
+
     # STT 누적 텍스트 + 3모달 감정 융합 + 스텝별 시스템 프롬프트 + 히스토리 → LLM 응답 생성
     # 반환: {"llm_response": LLMResponse, "transition": str|None, "step_status": dict, "next_step_status": dict}
     async def generate_response(self, session_id: str) -> Optional[dict]:
@@ -237,41 +283,29 @@ class CounselingPipeline:
 
         face_emotions = self._face_emotion_buffer.get(session_id, [])
         voice_emotions = self._voice_emotion_buffer.get(session_id, [])
-        # 단일 히스토리 소스: CounselingSession._histories
-        history = self.session.get_history(session_id)
+        history_mgr = self.session.get_history_manager(session_id)
+        history = history_mgr.get_recent_turns() if history_mgr else []
         loop = asyncio.get_event_loop()
 
         # ── 현재 단계 + 질문 정보 (StepManager) ──────────────
         step_mgr = self.session.get_step_manager(session_id)
         user_text_for_llm = accumulated_text  # LLM에 전달할 텍스트 (질문 힌트 포함 가능)
         if step_mgr:
-            base_prompt = step_mgr.get_system_prompt()
             current_q = step_mgr.get_current_question()
             q_idx = step_mgr.current_question_idx
             total_q = len(step_mgr.get_questions())
-            KOREAN_RULE = "반드시 한국어로만 대답하세요. 영어 단어를 절대 사용하지 마세요."
+            # 동적 system_prompt 조립 (분석 + 단계 + 이전 단계 요약 + 응답 지시)
+            system_prompt = self._build_dynamic_system_prompt(step_mgr, current_q, history_mgr)
             if current_q:
-                # ① system_prompt: 구조화된 응답 형식 지시
-                system_prompt = (
-                    f"{base_prompt}\n\n"
-                    f"[이번 응답 지시 - 반드시 준수]\n"
-                    f"① 사용자의 말에 1~2문장으로 진심 어린 공감을 표현하세요.\n"
-                    f"② 아래 CBT 질문을 자연스럽게 이어서 마지막에 물어보세요:\n"
-                    f"   {current_q}\n"
-                    f"③ 이 질문 외에 다른 질문은 절대 추가하지 마세요.\n"
-                    f"④ {KOREAN_RULE}"
-                )
-                # ② user_text: 소형 LLM은 system보다 최근 user 메시지를 더 강하게 따름
-                #    → 질문을 user_text 끝에도 명시하여 이중 강조 (히스토리엔 원본만 저장)
+                # 소형 LLM은 system보다 최근 user 메시지를 더 강하게 따름
+                # → 질문을 user_text 끝에도 명시하여 이중 강조 (히스토리엔 원본만 저장)
                 user_text_for_llm = (
                     f"{accumulated_text}\n\n"
                     f"[지금 반드시 이 질문으로 마무리하세요: {current_q}]"
                 )
-            else:
-                system_prompt = base_prompt + f"\n\n{KOREAN_RULE}"
             logger.info(
                 f"[Generate] {session_id}: Step {step_mgr.step_number} "
-                f"'{step_mgr.current_step['title']}' "
+                f"'{step_mgr.current_step['name']}' "
                 f"Q{q_idx + 1}/{total_q}: '{current_q}'"
             )
         else:
@@ -336,8 +370,10 @@ class CounselingPipeline:
         if response.suggested_action:
             logger.info(f"[LLM] 추천 행동: '{response.suggested_action}'")
 
-        # 히스토리에 이번 턴 추가 (CounselingSession 단일 관리)
-        self.session.add_to_history(session_id, accumulated_text, response.reply_text)
+        # 히스토리에 이번 턴 추가 (HistoryManager에 저장)
+        if history_mgr:
+            history_mgr.add_user_message(accumulated_text)
+            history_mgr.add_assistant_message(response.reply_text)
 
         # advance_question() 전 상태 스냅샷 (Qwen이 방금 다룬 질문 정보)
         pre_advance_status = step_mgr.get_status() if step_mgr else None
@@ -347,12 +383,31 @@ class CounselingPipeline:
         if step_mgr:
             transition = step_mgr.advance_question()
             if transition == "step_changed":
+                # 완료된 단계 요약 → HistoryManager에 저장 (다음 단계 system_prompt에 주입됨)
+                if history_mgr and pre_advance_status:
+                    completed_step_num = pre_advance_status["step"]
+                    completed_step_name = pre_advance_status["title"]
+                    # GPT 요약은 동기 호출이지만 짧음(~1-2초). 별도 thread로 실행
+                    await loop.run_in_executor(
+                        None,
+                        history_mgr.on_step_transition,
+                        completed_step_num,
+                        completed_step_name,
+                    )
                 logger.info(
                     f"[StepMgr] {session_id}: → Step {step_mgr.step_number} "
-                    f"'{step_mgr.current_step['title']}' 시작 "
+                    f"'{step_mgr.current_step['name']}' 시작 "
                     f"(Q1: '{step_mgr.get_current_question()}')"
                 )
             elif transition == "counseling_complete":
+                # 마지막 단계 요약도 저장 (리포트용)
+                if history_mgr and pre_advance_status:
+                    await loop.run_in_executor(
+                        None,
+                        history_mgr.on_step_transition,
+                        pre_advance_status["step"],
+                        pre_advance_status["title"],
+                    )
                 logger.info(f"[StepMgr] {session_id}: 전체 상담 완료")
 
         # advance_question() 후 상태 스냅샷 (다음에 다룰 질문 정보)
